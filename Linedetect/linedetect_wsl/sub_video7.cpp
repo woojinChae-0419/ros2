@@ -1,162 +1,249 @@
-#include "rclcpp/rclcpp.hpp"                  // ROS 2 C++ 클라이언트 라이브러리 (핵심)
-#include "sensor_msgs/msg/image.hpp"          // ROS 2 이미지 메시지 타입 정의
-#include "cv_bridge/cv_bridge.h"              // ROS 이미지 메시지 <-> OpenCV Mat 간 변환 라이브러리
-#include <opencv2/opencv.hpp>                 // OpenCV 컴퓨터 비전 라이브러리 (영상 처리 핵심)
-#include <chrono>                             // 시간 관련 함수 (처리 시간 측정용)
-#include <iostream>                           // 표준 입출력 (std::cout, std::endl 사용)
+#include "rclcpp/rclcpp.hpp"                  // ROS2 노드를 생성·관리하고, 로그 출력, 타이머 등을 사용하기 위한 핵심 헤더
+#include "sensor_msgs/msg/image.hpp"          // ROS2에서 사용하는 Image 메시지 타입 (sensor_msgs/Image)
+#include "cv_bridge/cv_bridge.h"              // ROS Image ↔ OpenCV Mat 변환을 담당하는 브릿지 라이브러리
+#include <opencv2/opencv.hpp>                 // OpenCV 기본 기능 (영상 처리, 그레이 변환, 이진화, 컨투어 등)
+#include <chrono>                             // 처리 시간 측정용 C++ 표준 라이브러리
+#include <iostream>
 
-using std::placeholders::_1;                  // 콜백 함수 바인딩을 위한 플레이스홀더
-using namespace cv;                           // OpenCV 네임스페이스 사용
-using namespace std;                          // 표준 네임스페이스 사용
+using std::placeholders::_1;
+using namespace cv;
+using namespace std;
 
+// =====================================================================
+//                   LineDetector7 – 라인 검출 및 error 계산 노드
+// =====================================================================
+// 이 노드는 ROS2에서 전달되는 영상(topic: video/image_raw)를 받아서
+// 1) ROI 설정 (아래쪽 90px만 사용 → 연산 속도 향상)
+// 2) 밝기 보정 → 조도 변화에 강하게 만듦
+// 3) Threshold → 흰색 라인을 쉽게 분리
+// 4) Connected Components (라벨링)으로 라인 후보 영역 추출
+// 5) 이전 라인 중심(prev_line_x_)과 가장 가까운 영역만 선택 → 안정적 트래킹
+// 6) 이미지 중심(320)과 라인 중심의 차이를 error로 출력
+// =====================================================================
 class LineDetector7 : public rclcpp::Node
 {
 public:
-  LineDetector7()
-  : Node("line_detector_7") // **노드 이름 정의**: 'line_detector_7'
-  {
-    // 'video/image_raw' 토픽을 구독하는 구독자 생성 (QoS 10)
-    subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
-      "video/image_raw", 10, std::bind(&LineDetector7::topic_callback, this, _1));
-    
-    // **라인 추적을 위한 초기 위치 설정**
-    // 영상 중앙(320)으로 시작 위치 가정
-    prev_line_x_ = 320; 
-  }
+
+  LineDetector7()
+  : Node("line_detector_7")   // 노드 이름 (같은 기능 다른 버전 테스트용으로 번호 분리)
+  {
+    // ------------------------------------------------------------------
+    // ROS2 이미지 토픽 구독 설정
+    // ------------------------------------------------------------------
+    // - 구독 대상: "video/image_raw"
+    // - 메시지 타입: sensor_msgs::msg::Image
+    // - 큐 크기: 10
+    // - 콜백 함수: topic_callback
+    // ------------------------------------------------------------------
+    subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
+      "video/image_raw",        // 구독할 토픽 이름
+      10,                        // 큐 사이즈
+      std::bind(&LineDetector7::topic_callback, this, _1) // 콜백 연결
+    );
+    
+    // 이전 프레임에서 찾은 라인 중심 x값 저장.
+    // 초기에는 화면 정중앙(320px)으로 설정해서 첫 프레임 선택 기준을 삼음.
+    prev_line_x_ = 320;
+  }
 
 private:
-  // **구독 콜백 함수**: 새 이미지 메시지가 도착할 때마다 호출됨
-  void topic_callback(const sensor_msgs::msg::Image::SharedPtr msg)
-  {
-    // 1. 시간 측정 시작 (노드 처리 성능 분석용)
-    auto start_time = std::chrono::steady_clock::now();
 
-    // ROS2 이미지 메시지를 OpenCV Mat 형식(BGR 3채널)으로 변환
-    cv::Mat img = cv_bridge::toCvCopy(msg, "bgr8")->image;
-    
-    // 2. 전처리 (Preprocessing) 단계
-    
-    // 2-1. **ROI (Region of Interest) 선정**
-    // 영상 하단 1/4 영역 (y=270부터 90픽셀 높이)만 관심 영역으로 지정
-    int roi_y = 270; 
-    int roi_h = 90;  
-    cv::Rect roi_rect(0, roi_y, 640, roi_h); 
-    cv::Mat roi = img(roi_rect); // 원본 이미지에서 ROI 영역만 잘라냄
+  // =====================================================================
+  //                     이미지 수신 콜백 함수
+  // =====================================================================
+  // 매 프레임 호출됨.
+  // msg: sensor_msgs::msg::Image 형식의 이미지 한 프레임.
+  // 내부에서 OpenCV 영상 처리 수행.
+  // =====================================================================
+  void topic_callback(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    // ------------------------------------------------------------
+    // ⏱ 처리 시간 측정 시작 (성능 로그 출력용)
+    // ------------------------------------------------------------
+    auto start_time = std::chrono::steady_clock::now();
 
-    // 2-2. **그레이스케일 변환**
-    cv::Mat gray;
-    cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+    // ------------------------------------------------------------
+    // 1. ROS2 Image 메시지 → OpenCV Mat(BGR8)로 변환
+    // ------------------------------------------------------------
+    // - ROS에서 받은 이미지는 sensor_msgs/Image 형식
+    // - cv_bridge를 통해 OpenCV 형식(Mat)으로 변환해야 영상 처리 가능
+    // ------------------------------------------------------------
+    cv::Mat img = cv_bridge::toCvCopy(msg, "bgr8")->image;
+    
+    // =====================================================================
+    //                    2. ROI 설정 (이미지 아래쪽만 사용)
+    // =====================================================================
+    // - 주행 영상에서는 차선이 주로 화면 하단에 위치하므로,
+    //   전체 480px 중 마지막 90px만 사용하여 효율 극대화.
+    //   → 연산 시간이 크게 감소하고, 노이즈도 줄어듦.
+    // - ROI 영역: y = 270 ~ 360
+    // =====================================================================
+    int roi_y = 270;                 
+    int roi_h = 90;
 
-    // 2-3. **밝기 보정 (Illumination compensation)**
-    // 현재 ROI의 평균 밝기를 목표 밝기(100)로 보정하여 조명 변화에 대응
-    cv::Scalar mean_val = cv::mean(gray); 
-    int brightness_diff = 100 - (int)mean_val[0]; // 목표 밝기 - 현재 평균 밝기
-    gray = gray + brightness_diff; // 영상 전체에 밝기 차이만큼 더해 보정
+    cv::Rect roi_rect(0, roi_y, 640, roi_h);  // (x, y, width, height)
+    cv::Mat roi = img(roi_rect);               // ROI 추출
 
-    // 2-4. **이진화 (Thresholding)**
-    cv::Mat binary;
-    // 임계값 170 적용: 170보다 밝으면 흰색(255), 어두우면 검은색(0)으로 변환
-    cv::threshold(gray, binary, 170, 255, cv::THRESH_BINARY);
-    
-    // 2-5. **모폴로지(열림) 연산을 통한 작은 노이즈 제거**
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)); 
-    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel); // 열림 연산으로 잡티 제거
+    // =====================================================================
+    //       3. 그레이스케일 변환 + 밝기 보정(조도 변화 보완)
+    // =====================================================================
+    // (1) RGB → Gray 변환  
+    // (2) 평균 밝기를 읽어 들여서 목표 밝기(100)로 강제 이동  
+    //     → 조명 어둡거나 밝아도 threshold 민감도 감소  
+    // =====================================================================
+    cv::Mat gray;
+    cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
 
-    // 이진화된 흑백 영상에 검출 결과를 시각화하기 위해 BGR(3채널)로 변환
-    cv::Mat binary_color;
-    cv::cvtColor(binary, binary_color, cv::COLOR_GRAY2BGR);
+    // ROI 평균 밝기
+    cv::Scalar mean_val = cv::mean(gray);
+    // 목표 밝기 100과 현재 밝기 차이 계산
+    int brightness_diff = 100 - (int)mean_val[0];
+    // 전체 픽셀 밝기 이동 → 전체 ROI 밝기를 일정하게 유지
+    gray = gray + brightness_diff;
 
-    // 3. 라인 검출 (Connected Components / 레이블링)
-    // 연결된 픽셀 덩어리(객체)를 찾고 통계 정보(면적, 중심 등)를 추출
-    cv::Mat labels, stats, centroids;
-    int num_labels = cv::connectedComponentsWithStats(binary, labels, stats, centroids); // 0번은 배경
+    // =====================================================================
+    //                        4. 이진화 (Threshold)
+    // =====================================================================
+    // threshold = 170
+    // 회색조에서 밝은 부분(라인)을 255(흰색)로 설정하여 형태 분리하기 위함.
+    // =====================================================================
+    cv::Mat binary;
+    cv::threshold(gray, binary, 170, 255, cv::THRESH_BINARY);
+    
+    // ● 작은 점/노이즈 제거를 위한 열기(Open) 연산 (침식→팽창)
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
 
-    int best_line_idx = -1;           // 최종 라인의 레이블 인덱스
-    double min_dist = 99999.0;       // 이전 라인 위치와의 최소 거리
-    
-    // 배경(i=0)을 제외한 모든 후보 객체(i=1부터)를 순회
-    for (int i = 1; i < num_labels; i++) {
-        int area = stats.at<int>(i, cv::CC_STAT_AREA);       // 객체의 면적
-        int cx = (int)centroids.at<double>(i, 0);           // 객체의 무게 중심 X좌표
-        
-        // 3-1. 노이즈 제거 (면적 필터링)
-        // 너무 작거나 (100 미만) 너무 큰 (5000 초과) 객체는 무시
-        if (area < 100 || area > 5000) continue; 
+    // 시각화를 위한 컬러 버전 (Binary는 1채널 → 3채널 BGR로 변경)
+    cv::Mat binary_color;
+    cv::cvtColor(binary, binary_color, cv::COLOR_GRAY2BGR);
 
-        int x = stats.at<int>(i, cv::CC_STAT_LEFT);        
-        int y = stats.at<int>(i, cv::CC_STAT_TOP);         
-        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);       
-        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);      
+    // =====================================================================
+    //             5. Connected Components(라벨링)
+    // =====================================================================
+    // 흰색(255) 부분을 각각 하나의 “영역”으로 나누어서
+    // 각 라인의 중심점, 면적, bounding box 등 다양한 정보를 얻음.
+    // =====================================================================
+    cv::Mat labels, stats, centroids;
+    int num_labels = cv::connectedComponentsWithStats(
+        binary,       // 입력 이진 이미지
+        labels,       // 결과 라벨 맵
+        stats,        // 각 영역의 bounding box + area 등 정보
+        centroids     // 각 영역의 중심점(x, y)
+    );
 
-        // **라인 후보 시각화**: 파란색 박스와 중심점 그리기
-        cv::rectangle(binary_color, cv::Rect(x, y, w, h), cv::Scalar(255, 0, 0), 1); // 파란색 박스
-        cv::circle(binary_color, cv::Point(cx, y + h/2), 3, cv::Scalar(255, 0, 0), -1); // 파란색 점
+    // 최종 선택된 라인 ID (-1이면 유효한 객체 없음)
+    int best_line_idx = -1;
+    double min_dist = 99999.0;     // 이전 중심과의 최소 거리
 
-        // 3-2. **트래킹**: 이전 라인 위치(prev_line_x_)와 현재 후보 중심(cx)의 거리 계산
-        double dist = std::abs(cx - prev_line_x_);
-        // 이전 라인 위치와 가장 가까운 객체를 최종 라인으로 임시 선택
-        if (dist < min_dist) {
-            min_dist = dist;
-            best_line_idx = i;
-        }
-    }
+    // =====================================================================
+    //        6. 검출된 모든 라인 후보 영역 탐색
+    // =====================================================================
+    // i = 0 → 배경(background) 이므로 제외
+    // 1~num_labels-1 까지가 실제 객체들
+    // =====================================================================
+    for (int i = 1; i < num_labels; i++) {
 
-    int error = 0;
-    
-    // 4. 최종 라인 결정 및 에러 계산 (강화된 트래킹 로직)
-    // **80픽셀 이내일 경우만** 이전 라인과 동일한 라인으로 인정 (바깥쪽 선/노이즈 무시 필터)
-    if (best_line_idx != -1 && min_dist < 80.0) {
-        // **라인 추적에 성공한 경우**
-        int cx = (int)centroids.at<double>(best_line_idx, 0); // 최종 라인 중심 X좌표
-        int x = stats.at<int>(best_line_idx, cv::CC_STAT_LEFT);
-        int y = stats.at<int>(best_line_idx, cv::CC_STAT_TOP);
-        int w = stats.at<int>(best_line_idx, cv::CC_STAT_WIDTH);
-        int h = stats.at<int>(best_line_idx, cv::CC_STAT_HEIGHT);
+        // 각 영역에 대한 면적 정보
+        int area = stats.at<int>(i, cv::CC_STAT_AREA);
 
-        // **최종 라인 시각화**: 빨간색 박스와 점으로 표시 (추적 성공 확인)
-        cv::rectangle(binary_color, cv::Rect(x, y, w, h), cv::Scalar(0, 0, 255), 2);
-        cv::circle(binary_color, cv::Point(cx, y + h/2), 4, cv::Scalar(0, 0, 255), -1); 
+        // 중심점 x
+        int cx = (int)centroids.at<double>(i, 0);
 
-        // **에러 계산**
-        error = 320 - cx; // 로봇 목표 중심(320) - 라인 중심(cx)
-        prev_line_x_ = cx; // **추적 위치 업데이트**: 다음 주기를 위해 현재 위치 저장
-    } else {
-        // **라인을 찾지 못했거나 (유실), 너무 멀리 떨어진 경우 (바깥쪽 선)**
-        
-        // 4-2. **에러 계산 (Keep Going)**
-        // 에러는 **이전 라인 위치**를 기준으로 계산하여, 라인이 유실되어도 **직진/직전 방향을 유지**하도록 지시
-        error = 320 - prev_line_x_;
-        
-        // **추적 위치는 업데이트하지 않음**: prev_line_x_는 이전 값을 유지한 채 추적을 지속 시도
-    }
+        // 너무 작거나 너무 큰 영역 제외 (100px 미만 노이즈, 5000px 초과 큰 물체)
+        if (area < 100 || area > 5000) continue;
 
-    // 5. 처리 시간 계산 및 출력
-    auto end_time = std::chrono::steady_clock::now();
-    float processing_time = std::chrono::duration<float, std::milli>(end_time - start_time).count();
+        // bounding box 정보
+        int x = stats.at<int>(i, cv::CC_STAT_LEFT);
+        int y = stats.at<int>(i, cv::CC_STAT_TOP);
+        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
 
-    // 터미널 출력: 현재 에러 값과 처리 시간
-    std::cout << "error: " << error << ", time: " << processing_time << " ms" << std::endl;
+        // ------------------------------------------
+        // 모든 후보: 파란색(BGR: 255,0,0)으로 표시
+        // ------------------------------------------
+        cv::rectangle(binary_color, cv::Rect(x, y, w, h),
+                      cv::Scalar(255, 0, 0), 1);
+        cv::circle(binary_color, cv::Point(cx, y + h/2),
+                   3, cv::Scalar(255, 0, 0), -1);
 
-    // 화면 출력: 원본 영상, 이진화된 결과(시각화 포함) 분리 출력
-    cv::imshow("Original Full Image", img); 
-    cv::imshow("Binary Result View", binary_color); 
+        // 이전 중심(prev_line_x_)과의 거리 계산 → 가장 가까운 객체 선택
+        double dist = abs(cx - prev_line_x_);
 
-    cv::waitKey(1); // GUI 이벤트를 처리하고 다음 프레임으로 넘어갈 준비 (OpenCV 필수)
-  }
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_line_idx = i;
+        }
+    }
 
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
-  int prev_line_x_; // 이전 주기 라인 중심 X좌표 (라인 트래킹 상태 변수)
+    // =====================================================================
+    //            7. 최종 라인 선택 + error 계산
+    // =====================================================================
+    // 조건:
+    // ① 후보 존재(best_line_idx != -1)
+    // ② 이전 중심(prev_line_x_)과의 거리 80px 이하일 때만 인정
+    // =====================================================================
+    int error = 0;
+
+    if (best_line_idx != -1 && min_dist < 80.0) {
+
+        // 선택된 라인의 중심/박스 정보 가져오기
+        int cx = (int)centroids.at<double>(best_line_idx, 0);
+        int x = stats.at<int>(best_line_idx, cv::CC_STAT_LEFT);
+        int y = stats.at<int>(best_line_idx, cv::CC_STAT_TOP);
+        int w = stats.at<int>(best_line_idx, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(best_line_idx, cv::CC_STAT_HEIGHT);
+
+        // 선택된 라인은 빨간색으로 강조
+        cv::rectangle(binary_color, cv::Rect(x, y, w, h),
+                      cv::Scalar(0, 0, 255), 2);
+        cv::circle(binary_color, cv::Point(cx, y + h/2),
+                   4, cv::Scalar(0, 0, 255), -1);
+
+        // 화면 중심(320)과 cx 차이 → steering error
+        error = 320 - cx;
+
+        // 현재 중심을 다음 프레임 기준점으로 저장
+        prev_line_x_ = cx;
+
+    } else {
+        // 라인 못 찾으면 이전 중심 기준으로 error 유지
+        error = 320 - prev_line_x_;
+    }
+
+    // =====================================================================
+    //                        8. 처리 시간 계산
+    // =====================================================================
+    auto end_time = std::chrono::steady_clock::now();
+    float processing_time =
+        std::chrono::duration<float, std::milli>(end_time - start_time).count();
+
+    std::cout << "error: " << error << ", time: "
+              << processing_time << " ms" << std::endl;
+
+    // =====================================================================
+    //                           9. 화면 출력
+    // =====================================================================
+    cv::imshow("Original Full Image", img); 
+    cv::imshow("Binary Result View", binary_color); 
+
+    cv::waitKey(1);
+  }
+
+  // ------------------------------------------------------------
+  // 멤버 변수: 구독자 핸들 + 이전 라인 중심
+  // ------------------------------------------------------------
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
+  int prev_line_x_;   // 트래킹 안정성 확보용
 };
 
+// =====================================================================
+//                                main()
+// =====================================================================
 int main(int argc, char * argv[])
 {
-  // ROS 2 시스템 초기화 (필수)
-  rclcpp::init(argc, argv);
-  
-  // 노드 실행: LineDetector7 객체를 생성하고 spin (ROS 이벤트 반복 처리)
-  rclcpp::spin(std::make_shared<LineDetector7>());
-  
-  // ROS 2 시스템 종료 (필수)
-  rclcpp::shutdown();
-  return 0;
+  rclcpp::init(argc, argv);                        // ROS2 시스템 초기화
+  rclcpp::spin(std::make_shared<LineDetector7>()); // 노드 생성 후 spin 실행
+  rclcpp::shutdown();                              // ROS2 종료
+  return 0;
 }
