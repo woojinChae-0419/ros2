@@ -1,94 +1,126 @@
-# CMake를 사용하기 위한 최소 요구 버전 설정 (3.5 버전 지정)
+# CMake 최소 요구 버전 설정 (ROS2 Foxy 등에서 기본적으로 3.5 이상 사용)
 cmake_minimum_required(VERSION 3.5)
-# **프로젝트 이름** 설정 (ROS 2 패키지 이름과 일치해야 함)
+
+# 프로젝트 이름 지정
 project(linedetect_nano)
 
-# -----------------------------------------------------------
-# C/C++ 표준 버전 설정
-# -----------------------------------------------------------
-# C 표준이 설정되지 않은 경우 C99로 기본 설정
+# ============================================================
+#                   C / C++ 표준 설정
+# ============================================================
+
+# C 언어 표준(C99) 사용
 if(NOT CMAKE_C_STANDARD)
-  set(CMAKE_C_STANDARD 99)
+  set(CMAKE_C_STANDARD 99)
 endif()
 
-# C++ 표준이 설정되지 않은 경우 C++14로 기본 설정
+# C++ 표준(C++14) 사용
+# Jetson Nano + ROS2 환경에서는 C++14가 가장 호환성이 좋음
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 14)
 endif()
 
-# GCC 또는 Clang 컴파일러를 사용하는 경우 컴파일 옵션 추가
+# GCC 또는 Clang 컴파일러 사용 시 경고 옵션 추가
+# -Wall: 일반적인 모든 경고
+# -Wextra: 추가적인 경고
+# -Wpedantic: 표준 위반 코드 경고
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  # -Wall, -Wextra: 모든 일반적인 경고와 추가적인 경고를 활성화
-  # -Wpedantic: C/C++ 표준을 엄격하게 준수하도록 경고 활성화
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# -----------------------------------------------------------
-# 필수 패키지 및 라이브러리 찾기 (find dependencies)
-# -----------------------------------------------------------
+# ============================================================
+#                ROS2 / OpenCV 라이브러리 찾기
+# ============================================================
 
-# ROS 2 빌드 시스템(ament) 관련 패키지 찾기
+# ament 빌드 시스템 필수
 find_package(ament_cmake REQUIRED)
-# ROS Client Library C++ 찾기 (ROS 2 노드 개발에 필수)
+
+# ROS2 rclcpp (C++ 기반 노드)
 find_package(rclcpp REQUIRED)
-# ROS 센서 메시지 타입 찾기 (Image 메시지 사용에 필수)
+
+# ROS2 이미지 메시지 타입(sensor_msgs/msg/Image)
 find_package(sensor_msgs REQUIRED)
-# ROS 메시지 <-> OpenCV Mat 간 변환 라이브러리 찾기
+
+# ROS 이미지 ↔ OpenCV 이미지 변환(cv_bridge)
 find_package(cv_bridge REQUIRED)
-# ROS 표준 메시지 타입 찾기 (std_msgs::msg::Header 사용에 필요)
+
+# 기본 메시지(std_msgs) 사용 — 헤더 포함용
 find_package(std_msgs REQUIRED)
-# 이미지 전송 최적화 라이브러리 찾기
+
+# 이미지 전송 기능(image_transport): 성능 개선용
 find_package(image_transport REQUIRED)
 
-# OpenCV 라이브러리 찾기 (OpenCV 비디오 캡처 및 영상 처리에 필수)
-find_package(OpenCV REQUIRED) 
+# OpenCV 라이브러리 찾기
+find_package(OpenCV REQUIRED)
 
-# =======================================================
-# 실행 파일 정의 및 의존성 연결
-# =======================================================
+# ============================================================
+#               과제 1: Video Publisher 5
+#     기존 pub.cpp → pub_video5.cpp로 변경된 버전
+# ============================================================
 
-# [과제 1용 노드] pub_video5.cpp 정의
-# 'video_publisher_5'라는 실행 파일 이름 정의 및 소스 파일 지정
+# 실행파일 video_publisher_5 생성
+# 사용되는 소스 파일: src/pub_video5.cpp
 add_executable(video_publisher_5 src/pub_video5.cpp)
-# ROS 2 및 관련 라이브러리 의존성 연결 (ament_cmake를 통해 자동으로 연결됨)
-ament_target_dependencies(video_publisher_5 rclcpp sensor_msgs cv_bridge std_msgs image_transport)
-# **OpenCV 라이브러리 연결**: 비디오 캡처 기능을 사용하기 위해 OpenCV 라이브러리를 명시적으로 링크
-target_link_libraries(video_publisher_5 ${OpenCV_LIBS})
 
-# [과제 2용 노드] pub_video7.cpp 정의
-# 'video_publisher_7'라는 실행 파일 이름 정의 및 소스 파일 지정
-add_executable(video_publisher_7 src/pub_video7.cpp)
-# ROS 2 및 관련 라이브러리 의존성 연결
-ament_target_dependencies(video_publisher_7 rclcpp sensor_msgs cv_bridge std_msgs image_transport)
-# **OpenCV 라이브러리 연결**: 비디오 캡처 기능을 사용하기 위해 OpenCV 라이브러리를 명시적으로 링크
-target_link_libraries(video_publisher_7 ${OpenCV_LIBS})
-# =======================================================
-
-# -----------------------------------------------------------
-# 설치 규칙 (install)
-# -----------------------------------------------------------
-# 빌드된 실행 파일들을 ROS 2 환경에 설치할 위치를 정의
-install(TARGETS
-  video_publisher_5
-  video_publisher_7
-  # 설치 경로: ROS 2 패키지의 'lib/linedetect_nano' 디렉토리
-  DESTINATION lib/${PROJECT_NAME}
+# video_publisher_5가 필요한 패키지 연결
+ament_target_dependencies(
+  video_publisher_5
+  rclcpp           # ROS2 C++ 노드
+  sensor_msgs      # 이미지 메시지
+  cv_bridge        # OpenCV 변환
+  std_msgs         # 기본 메시지
+  image_transport  # 이미지 퍼블리싱 최적화
 )
 
-# -----------------------------------------------------------
-# 테스트 환경 설정 (선택 사항)
-# -----------------------------------------------------------
+# OpenCV 라이브러리 링크 연결
+target_link_libraries(video_publisher_5 ${OpenCV_LIBS})
+
+# ============================================================
+#               과제 2: Video Publisher 7
+#           추가된 pub_video7.cpp로 노드 생성
+# ============================================================
+
+# 실행파일 video_publisher_7 생성
+add_executable(video_publisher_7 src/pub_video7.cpp)
+
+# 의존성 패키지 연결
+ament_target_dependencies(
+  video_publisher_7
+  rclcpp
+  sensor_msgs
+  cv_bridge
+  std_msgs
+  image_transport
+)
+
+# OpenCV 링크 추가
+target_link_libraries(video_publisher_7 ${OpenCV_LIBS})
+
+# ============================================================
+#                   설치 규칙 (빌드 후 경로)
+# ============================================================
+
+# 빌드 후 실행 파일을 lib/<프로젝트명> 에 설치
+install(TARGETS
+  video_publisher_5
+  video_publisher_7
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# ============================================================
+#                     테스트 설정
+# ============================================================
+
 if(BUILD_TESTING)
-  # 테스트 코드의 정적 분석(Linting)을 위한 패키지 찾기
-  find_package(ament_lint_auto REQUIRED)
-  
-  # 정적 분석 관련 옵션 주석 처리 (기본 설정 유지)
-  #set(ament_cmake_copyright_FOUND TRUE)
-  #set(ament_cmake_cpplint_FOUND TRUE)
-  
-  # 테스트 의존성 찾기 및 연결
-  ament_lint_auto_find_test_dependencies()
+  find_package(ament_lint_auto REQUIRED)
+
+  # 아래 두 줄은 필요할 때만 사용
+  # 라이선스가 없거나 Git repo가 아닐 때를 위한 예외 처리 기능
+  #set(ament_cmake_copyright_FOUND TRUE)
+  #set(ament_cmake_cpplint_FOUND TRUE)
+
+  # lint(코드 규약 검사) 관련 의존성 자동 추가
+  ament_lint_auto_find_test_dependencies()
 endif()
 
-# ROS 2 패키지의 빌드 프로세스 완료 선언 (필수)
+# ament 패키지 설정 (필수)
 ament_package()
